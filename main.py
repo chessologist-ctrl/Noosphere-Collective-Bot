@@ -58,7 +58,7 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 # ------------------ Allowed Roles ------------------
-ALLOWED_ROLE_IDS = {1397015557185867799, 123456789012345678}
+ALLOWED_ROLE_IDS = {1374979741026746388, 1373028699766521936}
 
 def is_allowed(interaction_or_ctx):
     if isinstance(interaction_or_ctx, discord.Interaction):
