@@ -22,7 +22,8 @@ import requests
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_DOC_ID = os.getenv("GOOGLE_DOC_ID")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_SHEET_ID_COMPLAINTS = os.getenv("GOOGLE_SHEET_ID_COMPLAINTS")
+GOOGLE_SHEET_ID_AUDITOR = os.getenv("GOOGLE_SHEET_ID_AUDITOR")
 creds_json = os.getenv("GOOGLE_CREDS_JSON")
 
 # ------------------ Rate Limit ------------------
@@ -41,7 +42,8 @@ creds = service_account.Credentials.from_service_account_info(
 drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 gc = gspread.authorize(creds)
-sheet = gc.open("Auditor's Records")
+sheet_complaints = gc.open_by_key(GOOGLE_SHEET_ID_COMPLAINTS)
+sheet_auditor = gc.open_by_key(GOOGLE_SHEET_ID_AUDITOR)
 
 # ------------------ Discord Setup ------------------
 intents = discord.Intents.default()
@@ -72,7 +74,7 @@ def is_allowed(interaction_or_ctx):
 # ------------------ Revert Checker ------------------
 @tasks.loop(minutes=5)
 async def check_reverts():
-    ws = sheet.worksheet("Noosphere Collective")
+    ws = sheet_complaints.worksheet("Noosphere Collective")
     records = ws.get_all_records()
     for i, row in enumerate(records):
         if row.get("Revert") and row.get("Revert Sent") != "done":
@@ -192,7 +194,7 @@ async def on_message(message):
         date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         attachments = "\n".join([a.url for a in message.attachments])
         complaint = f"{content}\n{attachments}" if attachments else content
-        ws = sheet.worksheet("Noosphere Collective")
+        ws = sheet_complaints.worksheet("Noosphere Collective")
         ws.append_row([user_id, complaint, date, "", "", "", "", "", ""])
         await message.reply("✅ Your complaint has been received. Thank you!")
     await bot.process_commands(message)
@@ -219,7 +221,7 @@ async def on_voice_state_update(member, before, after):
     else:
         return
     try:
-        ws = sheet.worksheet(server_name)
+        ws = sheet_auditor.worksheet(server_name)
         ws.append_row([timestamp, user_id, msg, ch, server_name])
     except Exception as e:
         print(f"[AUDIT ERROR] {e}")
@@ -234,7 +236,7 @@ async def on_message(message):
     ch = f"💬 {message.channel.name}"
     server_name = message.guild.name
     try:
-        ws = sheet.worksheet(server_name)
+        ws = sheet_auditor.worksheet(server_name)
         ws.append_row([timestamp, user_id, content, ch, server_name])
     except Exception as e:
         print(f"[LOG ERROR] {e}")
