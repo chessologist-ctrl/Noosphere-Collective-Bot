@@ -1,4 +1,3 @@
-# main.py
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -32,6 +31,8 @@ RATE_LIMIT_WINDOW = 60
 usage_tracker = defaultdict(list)
 
 # ------------------ Google Auth ------------------
+if creds_json is None:
+    raise Exception("GOOGLE_CREDS_JSON environment variable not set")
 creds_dict = json.loads(creds_json)
 creds = service_account.Credentials.from_service_account_info(
     creds_dict,
@@ -42,7 +43,7 @@ creds = service_account.Credentials.from_service_account_info(
 drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 gc = gspread.authorize(creds)
-sheet_complaints = gc.open_by_key(GOOGLE_SHEET_ID_COMPLAINTS)
+sheet_complaints = gc.open_by_key(GOOGLE_SHEET_ID_COMPLAINTS).sheet1  # Default to sheet1 for Moderation Book
 sheet_auditor = gc.open_by_key(GOOGLE_SHEET_ID_AUDITOR)
 
 # ------------------ Discord Setup ------------------
@@ -62,9 +63,9 @@ ALLOWED_ROLE_IDS = {1397015557185867799, 123456789012345678}
 def is_allowed(interaction_or_ctx):
     if isinstance(interaction_or_ctx, discord.Interaction):
         member = interaction_or_ctx.guild.get_member(interaction_or_ctx.user.id)
-        if member.guild_permissions.administrator:
+        if member and member.guild_permissions.administrator:
             return True
-        return any(role.id in ALLOWED_ROLE_IDS for role in member.roles)
+        return any(role.id in ALLOWED_ROLE_IDS for role in member.roles) if member else False
     elif isinstance(interaction_or_ctx, commands.Context):
         member = interaction_or_ctx.author
         if member.guild_permissions.administrator:
@@ -74,25 +75,30 @@ def is_allowed(interaction_or_ctx):
 # ------------------ Revert Checker ------------------
 @tasks.loop(minutes=5)
 async def check_reverts():
-    ws = sheet_complaints.worksheet("Noosphere Collective")
-    records = ws.get_all_records()
+    records = sheet_complaints.get_all_records()
     for i, row in enumerate(records):
-        if row.get("Revert") and row.get("Revert Sent") != "done":
+        revert_message = row.get("Revert")
+        revert_sent = row.get("Revert Sent")
+        user_id = row.get("User Id")
+        if revert_message and revert_sent != "done":
             try:
-                user = await bot.fetch_user(int(row["User Id"]))
-                msg = row["Revert"]
-                text_parts, files = [], []
-                for part in msg.split("\n"):
-                    if part.strip().startswith("http") and any(x in part for x in [".png", ".jpg", ".jpeg"]):
-                        r = requests.get(part)
-                        if r.status_code == 200:
-                            files.append(discord.File(io.BytesIO(r.content), filename=part.split("/")[-1]))
+                user = await bot.fetch_user(int(user_id))
+                text_parts = []
+                files = []
+                for part in revert_message.split("\n"):
+                    if part.strip().startswith("http") and any(ext in part.lower() for ext in [".jpg", ".jpeg", ".png", ".gif"]):
+                        async with bot.http.HTTPClient_session.get(part.strip()) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                file = discord.File(io.BytesIO(data), filename=part.strip().split("/")[-1])
+                                files.append(file)
                     else:
-                        text_parts.append(part)
-                await user.send("\n".join(text_parts), files=files if files else None)
-                ws.update_cell(i + 2, 9, "done")
+                        text_parts.append(part.strip())
+                message_text = "\n".join(text_parts)
+                await user.send(content=message_text or None, files=files if files else None)
+                sheet_complaints.update_cell(i + 2, 9, "done")  # Column I = Revert Sent
             except Exception as e:
-                print(f"[REVERT ERROR] {e}")
+                print(f"[REVERT ERROR] Failed to send revert to {user_id}: {e}")
 
 # ------------------ Fetch Doc Content & Images ------------------
 async def fetch_doc_content_and_images(interaction=None, channel=None):
@@ -124,12 +130,12 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
     for obj_id, url in object_images.items():
         try:
             headers = {"Authorization": f"Bearer {creds.token}"}
-            r = requests.get(url, headers=headers)
-            if r.status_code == 200:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200 and r.headers.get('content-type', '').startswith('image'):
                 ext = r.headers['content-type'].split('/')[-1]
                 image_files.append(discord.File(io.BytesIO(r.content), filename=f"image_{obj_id}.{ext}"))
-        except:
-            continue
+        except Exception as e:
+            print(f"Image download failed for {url}: {e}")
     for obj_id in object_images:
         content = content.replace(f"[image:{obj_id}]", "")
     return content.strip(), image_files
@@ -143,25 +149,28 @@ def check_rate_limit(user_id):
     return len(usage) < RATE_LIMIT
 
 # ------------------ /announce ------------------
-@bot.tree.command(name="announce", description="Send an announcement from Google Docs")
+@bot.tree.command(name="announce", description="Send an announcement from Ministerial Scroll")
 @app_commands.describe(channel="Channel to send announcement")
 async def announce(interaction: discord.Interaction, channel: discord.TextChannel):
     if not is_allowed(interaction):
         await interaction.response.send_message("You lack permission.", ephemeral=True)
         return
-    if not check_rate_limit(interaction.user.id):
+    if not check_rate_limit(str(interaction.user.id)):
         await interaction.response.send_message("Rate limit hit.", ephemeral=True)
         return
-    usage_tracker[interaction.user.id].append(datetime.now().timestamp())
+    usage_tracker[str(interaction.user.id)].append(datetime.now().timestamp())
     await interaction.response.defer()
     try:
         text, images = await fetch_doc_content_and_images(interaction, channel)
-        await channel.send(text)
+        if not text and not images:
+            await interaction.followup.send("The document is empty.", ephemeral=True)
+            return
+        await channel.send(content=text or None)
         if images:
             await channel.send(files=images)
         await interaction.followup.send(f"Announcement sent to {channel.mention}.", ephemeral=True)
     except Exception as e:
-        print(e)
+        print(f"[ANNOUNCE ERROR] {e}")
         await interaction.followup.send("Error sending announcement.", ephemeral=True)
 
 # ------------------ !announce ------------------
@@ -170,17 +179,20 @@ async def announce_cmd(ctx, channel: discord.TextChannel):
     if not is_allowed(ctx):
         await ctx.send("You lack permission.")
         return
-    if not check_rate_limit(ctx.author.id):
+    if not check_rate_limit(str(ctx.author.id)):
         await ctx.send("Rate limit hit.")
         return
-    usage_tracker[ctx.author.id].append(datetime.now().timestamp())
+    usage_tracker[str(ctx.author.id)].append(datetime.now().timestamp())
     try:
         text, images = await fetch_doc_content_and_images(None, channel)
-        await channel.send(text)
+        if not text and not images:
+            await ctx.send("The document is empty.")
+            return
+        await channel.send(content=text or None)
         if images:
             await channel.send(files=images)
     except Exception as e:
-        print(e)
+        print(f"[ANNOUNCE ERROR] {e}")
         await ctx.send("Error sending announcement.")
 
 # ------------------ DM Complaint Logger ------------------
@@ -189,20 +201,46 @@ async def on_message(message):
     if message.author == bot.user:
         return
     if isinstance(message.channel, discord.DMChannel):
+        try:
+            user_id = str(message.author.id)
+            content = message.content
+            date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            attachments_text = "\n".join([a.url for a in message.attachments])
+            complaint = content + (f"\n{attachments_text}" if attachments_text else "")
+            sheet_complaints.append_row([user_id, complaint, date, "", "", "", "", "", ""])
+            await message.reply("✅ Your complaint has been received. Thank you!")
+        except Exception as e:
+            print(f"[DM LOG ERROR] Failed to log complaint from {user_id}: {e}")
+    else:
+        if message.author.bot:
+            return
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         user_id = str(message.author.id)
-        content = message.content
-        date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        attachments = "\n".join([a.url for a in message.attachments])
-        complaint = f"{content}\n{attachments}" if attachments else content
-        ws = sheet_complaints.worksheet("Noosphere Collective")
-        ws.append_row([user_id, complaint, date, "", "", "", "", "", ""])
-        await message.reply("✅ Your complaint has been received. Thank you!")
+        content = message.content + (f"\n{'\n'.join([a.url for a in message.attachments])}" if message.attachments else "")
+        channel = f"💬 {message.channel.name}"
+        server_name = message.guild.name
+        try:
+            ws = sheet_auditor.worksheet(server_name)
+            ws.append_row([timestamp, user_id, content, channel, server_name])
+        except Exception as e:
+            print(f"[LOG ERROR] {server_name}: {e}")
     await bot.process_commands(message)
 
 # ------------------ Auditor Logger ------------------
 @bot.event
 async def on_message_edit(before, after):
-    await on_message(after)
+    if after.author.bot or isinstance(after.channel, discord.DMChannel):
+        return
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    user_id = str(after.author.id)
+    content = after.content + (f"\n{'\n'.join([a.url for a in after.attachments])}" if after.attachments else "")
+    channel = f"💬 {after.channel.name}"
+    server_name = after.guild.name
+    try:
+        ws = sheet_auditor.worksheet(server_name)
+        ws.append_row([timestamp, user_id, f"Edited: {content}", channel, server_name])
+    except Exception as e:
+        print(f"[EDIT LOG ERROR] {server_name}: {e}")
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -211,43 +249,36 @@ async def on_voice_state_update(member, before, after):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     user_id = str(member.id)
     server_name = member.guild.name
+    message = ""
+    channel = ""
     if before.channel is None and after.channel:
-        msg, ch = "joined voice channel", f"🎙 {after.channel.name}"
+        message = "joined voice channel"
+        channel = f"🎙 {after.channel.name}"
     elif before.channel and after.channel is None:
-        msg, ch = "left voice channel", f"🎙 {before.channel.name}"
+        message = "left voice channel"
+        channel = f"🎙 {before.channel.name}"
     elif before.channel != after.channel:
-        msg = "switched voice channel"
-        ch = f"🎙 {before.channel.name} → {after.channel.name}"
+        message = "switched voice channel"
+        channel = f"🎙 {before.channel.name} → {after.channel.name}"
     else:
         return
     try:
         ws = sheet_auditor.worksheet(server_name)
-        ws.append_row([timestamp, user_id, msg, ch, server_name])
+        ws.append_row([timestamp, user_id, message, channel, server_name])
     except Exception as e:
-        print(f"[AUDIT ERROR] {e}")
-
-@bot.event
-async def on_message(message):
-    if message.author == bot.user or isinstance(message.channel, discord.DMChannel):
-        return
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    user_id = str(message.author.id)
-    content = message.content
-    ch = f"💬 {message.channel.name}"
-    server_name = message.guild.name
-    try:
-        ws = sheet_auditor.worksheet(server_name)
-        ws.append_row([timestamp, user_id, content, ch, server_name])
-    except Exception as e:
-        print(f"[LOG ERROR] {e}")
-    await bot.process_commands(message)
+        print(f"[VOICE LOG ERROR] {server_name}: {e}")
 
 # ------------------ Flask Keep Alive ------------------
 app = Flask('')
+
 @app.route('/')
 def home():
     return "Noosphere Collective Bot is alive!"
-threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+threading.Thread(target=run_flask, daemon=True).start()
 
 # ------------------ On Ready ------------------
 @bot.event
