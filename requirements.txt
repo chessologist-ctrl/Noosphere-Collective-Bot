@@ -1,0 +1,6 @@
+discord.py
+flask
+gspread
+oauth2client
+google-api-python-client
+python-dotenv
